@@ -1,0 +1,26 @@
+#!/bin/bash
+
+backuproot=/backup
+confroot=$backuproot/conf
+snapshotsroot=$backuproot/snapshots
+rsyncroot=$backuproot/rsync
+
+if [ "x$*" == x ]; then
+	echo "Error: no server specified"
+	exit 1
+fi
+
+cd $confroot || exit 1
+
+for server in $*
+do
+	host=`echo $server | sed 's:\..*::'`
+	for basedir in $confroot $snapshotsroot $rsyncroot
+	do
+		dir=$basedir/$host
+		[ -d $dir ] && continue
+		mkdir -v $dir || exit 1
+		chmod go= $dir
+	done
+	[ -n "`find skel -type f`" ] && cp -pv $confroot/skel/* $confroot/$host
+done

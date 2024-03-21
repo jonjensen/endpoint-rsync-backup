@@ -1,0 +1,51 @@
+#!/bin/bash
+
+# verify that backup tests are functional
+
+set -o pipefail
+
+## exit states
+STATE_OK=0
+STATE_WARNING=1
+STATE_CRITICAL=2
+STATE_UNKNOWN=3
+STATE_DEPENDENT=4
+
+## Configuration
+backuproot=/backup
+rsyncroot=$backuproot/rsync
+cd $backuproot/conf || {
+	echo "BACKUP CRITICAL: no dir $backuproot/conf" >&2
+	exit $STATE_CRITICAL
+}
+
+
+snap_dir=$( find $rsyncroot/* -maxdepth 0 -not -name servers.old -exec \
+ sh -c 'find "{}" -mindepth 1 -maxdepth 1 -name 'snapshot.2*'  | sort | grep -v snapshot.work | tail -n 1' \; \
+ | tr '\n' ' ')
+
+
+zfs_file_system=$(df -hT $snap_dir |awk '{print $2}'| grep zfs | wc -l)
+if [ $zfs_file_system -gt 1 ]; then
+	failures=$( find $rsyncroot/* -maxdepth 0 -not -name servers.old -exec \
+	sh -c 'find "{}" -mindepth 1 -maxdepth 1 -name 'snapshot.2*' | sort | grep -v snapshot.work | tail -n 1' \; \
+	| xargs -I{} grep -Hr '^fail ' {}/test.log 2>/dev/null \
+	| sed "s@$rsyncroot/\(.*\)/snapshot.*/test.log:@\1:@" \
+	| tr '\n' ' ')
+else
+	failures=$( find $rsyncroot/* -maxdepth 0 -not -name servers.old -exec \
+	sh -c 'find "{}" -mindepth 1 -maxdepth 1 -name 'rsync.0' | sort | grep -v snapshot.work | tail -n 1' \; \
+	| xargs -I{} grep -Hr '^fail ' {}/test.log 2>/dev/null \
+	| sed "s@$rsyncroot/\(.*\)/rsync.*/test.log:@\1:@" \
+	| tr '\n' ' ')
+fi
+
+search_result=$?
+
+if [ -n "$failures" ]; then
+    echo -n "BACKUP TEST WARN: $failures"
+	exit $STATE_WARNING
+else
+	echo -n "BACKUP TEST OK"
+	exit $STATE_OK
+fi

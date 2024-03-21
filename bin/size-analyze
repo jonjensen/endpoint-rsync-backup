@@ -1,0 +1,28 @@
+#!/usr/bin/perl
+
+# calculate the size of the backup set
+
+use warnings;
+use strict;
+
+my %servers;
+
+for my $base (qw( /mirrors /roomy )) {
+	chdir $base or die "Couldn't chdir $base: $!\n";
+	for my $server (<*>) {
+		chdir $base or die "Couldn't chdir $base: $!\n";
+		print("$server is not a directory\n"), next unless -d $server;
+		$servers{$server}{base} = $base;
+		chdir "$base/$server" or die "Couldn't chdir $base/$server: $!\n";
+		print $server, "\n";
+		for my $dir (<rsync.*>) {
+			print("$dir is not a directory?\n"), next unless -d $dir;
+			my $size = `du -ks $dir`;
+			$size =~ /^\s*(\d+)/ or warn("Couldn't read size!\n"), next;
+			$size = $1;
+			print "   $dir $size\n";
+			$servers{$server}{size}{$dir} = $size;
+		}
+		print "\n";
+	}
+}

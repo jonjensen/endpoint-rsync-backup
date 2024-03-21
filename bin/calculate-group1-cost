@@ -1,0 +1,41 @@
+#!/bin/sh
+
+# calculate the total usage of all servers that are in the group identified by the $servers variable
+servers="group1*"
+
+# set the rate at which this group should be billed for storage
+USD_per_GB=0.18
+
+backuproot=/backup
+rsyncroot="$backuproot/rsync"
+confroot="$backuproot/conf"
+
+hostname=$(hostname -s)
+FS=traditional
+if [ -f $confroot/$hostname-config ]; then
+    . $confroot/$hostname-config
+fi
+
+cd $rsyncroot || exit 1
+if [ "$FS" = zfs ]; then
+    for server in $(ls -d $servers); do
+        zfslist=$zfslist" $zfspool/$server"
+    done
+    size_B=$(zfs list -Hp $zfslist | awk '{print $2}' | paste -sd+ | bc -q)
+    size_GB=$(echo "$size_B / 1024 / 1024 / 1024" | bc -q )
+else
+    size_GB=$(du -scD -BG $servers | grep 'total$' | sed 's/G.*//')
+fi
+cost=$(echo "$size_GB * $USD_per_GB" | bc -q)
+
+echo "This is a summary of the backup utilization for the servers:"
+echo $servers
+echo
+echo "Total monthly cost for $size_GB GB @ \$$USD_per_GB = \$$cost"
+echo "(This should be run only on the backup server with more snapshots, and cost calculated only on that.)"
+
+if [ "$FS" = zfs ]; then
+    echo
+    echo "The sizing is based on the sum of these servers:"
+    zfs list $zfslist | awk '{print $1 "\t" $2}' | sed 's!.*/!!'
+fi

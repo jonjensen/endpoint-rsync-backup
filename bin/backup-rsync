@@ -1,0 +1,544 @@
+#!/bin/bash
+
+# rsync-backup
+# Script to do incremental rsync pull backups from multiple servers.
+# License: GPLv3+
+# by Jon Jensen <jon@endpointdev.com>
+# created ca. 2002-02-28
+# Major contributions by Kiel Christofferson and Josh Williams
+
+backuproot=/backup
+rsyncroot=$backuproot/rsync
+confroot=$backuproot/conf
+stdrsyncuser=epbackup
+stdrsyncpass=$(cat /etc/endpoint-backup.conf)
+stdrsyncopts=
+stdsshuser=root
+stdsshopt=
+
+# option defaults
+type=daily
+verbose=0
+retries=2
+retrywait=30
+dryrun=
+
+export TZ=UTC
+
+# if USER is empty, we are probably in cron
+# needed for timeline_events
+if [ -z "$USER" ]; then
+	export USER=$LOGNAME
+fi
+mypid=$$
+exit_status=0
+
+trap 'die' INT
+
+die() {
+	[[ -n "$sshcontrolpath" ]] && ssh -l $sshuser $sshopt -O exit $server 2>/dev/null
+	release_lock
+	exit $1
+}
+
+warn() {
+	echo "WARN: $1" >&2
+	return 0
+}
+
+echo_current_timestamp() {
+	date --rfc-3339=ns | sed 's/ /T/; s/+00:00$/Z/'
+}
+
+calctime() {
+	local totaltime
+	local start_time="$1"
+	local end_time="$2"
+	if [[ -n "$start_time" && -n "$end_time" ]]; then
+		totaltime=$(( ($end_time - $start_time) / 60 ))
+		echo $totaltime
+	fi
+}
+
+testpid() {
+	local pid="$1"
+	if [[ -n "$pid" ]]; then
+		if( kill -0 $pid 2>&1 )>/dev/null; then
+			return 0
+		else
+			return 1
+		fi
+	fi
+	return 1
+}
+
+get_lock() {
+	if [[ -z "$mypid" ]]; then warn "PID not known"; return 1; fi
+	local lockfile="rsync.lock"
+	if [[ -s "$lockfile" ]]; then
+		local curlock=$( cat $lockfile )
+		if [[ "$curlock" = "$mypid" ]]; then
+			return 0
+		else
+			echo "Backups for: \"$server_pretty\" locked by: \"$curlock\"... checking"
+			if testpid $curlock; then
+				warn "pid: \"$curlock\" is running..."
+				die 2
+			else
+				warn "pid: \"$curlock\" is not responding... taking over"
+				echo -n $mypid >$lockfile && return 0
+			fi
+		fi
+	else
+		echo -n $mypid >$lockfile
+		return 0
+	fi
+}
+
+release_lock() {
+	if [[ -z "$mypid" ]]; then warn "PID not known"; return 1; fi
+	local lockfile="rsync.lock"
+	if [[ -s "$lockfile" ]]; then
+		local curlock=$( cat $lockfile )
+		if [[ "$curlock" = "$mypid" ]]; then
+			rm -f $lockfile
+			return 0
+		fi
+	fi
+}
+
+send_timeline_event() {
+	local instance_id="$1"
+	local title="$2"
+	local kind="$3"
+	if [[ "$kind" = start ]]; then
+		args="--start_ts=now"
+	elif [[ "$kind" = end ]]; then
+		args="--end_ts=now"
+	else
+		die "Unknown send_timeline_event kind"
+	fi
+	local exit_code="$4"
+	if [[ -n "$exit_code" ]]; then
+		args="$args --exit_code=$exit_code"
+	fi
+	# (Not sending timeline events now)
+	#send_timeline_event.pl --instance_id="$instance_id" --title="$title" --esf=/etc/lwes/eventTypes.esf $args
+}
+
+usage() {
+	cat <<EOF
+
+Usage: $0 [-t class] [-v 1,2,3] [-r #] [-w #] [-d] server1 [server2 ...]
+
+-t class  specify some backup class; default is "$type"
+-v #      verbosity level 1, 2, or 3; default $verbose
+-r #      number of times to retry an rsync command that fails; default $retries
+-w #      seconds to wait between retries; default $retrywait
+-d        run in dry-run mode; if no '-v [123]' given, will use '--stats -v' with rsync
+
+The server arguments must be full server names and/or the names of text
+files in $confroot which contain a list of server names,
+one per line.
+
+A directory with the server's basename must exist in $confroot.
+Inside that directory should be a text file "daily-include" (or whatever
+the class name is if not daily). On each line is an absolute directory
+name whose entire contents will be backed up. Empty lines and comment
+lines beginning with # are allowed.
+
+An optional file "daily-exclude" (or other class) has the same format as
+the include file but specifies directories to exclude.
+
+The remote server must have an ssh public key for the root user, to match
+our private key.
+
+The rsync target is in $rsyncroot.
+EOF
+
+	exit 1
+}
+
+while getopts v:t:r:w:d opts
+do
+	if [ "$opts" = t ]; then
+		type=$OPTARG
+	elif [ "$opts" = v ]; then
+		verbose=$OPTARG
+	elif [ "$opts" = r ]; then
+		retries=$OPTARG
+	elif [ "$opts" = w ]; then
+		retrywait=$OPTARG
+	elif [ "$opts" = d ]; then
+		dryrun=1
+	elif [ "$opts" = '?' ]; then
+		echo "Error parsing options"
+		usage
+	fi
+done
+shift $(($OPTIND - 1))
+
+if [ "x$*" = x ]; then
+	echo "Error: no server specified"
+	usage
+fi
+
+if [ "$verbose" -eq 2 ]; then
+	extra="--stats"
+elif [ "$verbose" -eq 3 ]; then
+	extra="--stats -v -v"
+elif [ "$verbose" -eq 4 ]; then
+	extra="--stats -v -v --progress"
+elif [ "$verbose" -eq 5 ]; then
+	extra="--stats -v -v --progress"
+else
+	extra=
+fi
+
+if [ -n "$dryrun" -a -z "$extra" ]; then
+	extra="--stats -v"
+fi
+
+extracopy="$extra"
+
+servers=
+for server in $*
+do
+	if [ -f $confroot/$server -a -s $confroot/$server ]; then
+		servers="$servers `grep -v '^[[:space:]]*#\|^[[:space:]]*$' $confroot/$server`"
+	else
+		servers="$servers $server"
+	fi
+done
+
+hostname=$(hostname -s)
+FS=traditional
+if [ -f $confroot/$hostname-config ]; then
+	. $confroot/$hostname-config
+fi
+
+echo -e "Beginning backup on $hostname: $(echo_current_timestamp)\n"
+backupstart=$( date +%-s )
+[ "$verbose" -ge 1 ] && df -m
+echo
+
+unset SSH_AUTH_SOCK
+
+for server in $servers
+do
+	alias=
+	domain=
+	snapshots=
+	rsyncuser="$stdrsyncuser"
+	rsyncpass="$stdrsyncpass"
+	rsyncopts="$stdrsyncopts"
+	sshuser="$stdsshuser"
+	sshopt="$stdsshopt"
+	global_exclude=""
+	unreadable_ok=
+	bwlimit=
+
+	host=$( echo $server | sed 's:\..*::' )
+
+	# Override verbosity on a host-by-host basis.
+	if [ $host = noserver ]; then
+		extra="--stats -v"
+	else
+		extra="$extracopy"
+	fi
+
+	confdir=$confroot/$host
+	conffile=$confdir/backup.conf
+	if [ -f $conffile -a -s $conffile ]; then
+		. $conffile
+		[ -n "$domain" -a -n "$host" ] && server=$host.$domain
+	fi
+
+	server_pretty="$server"
+	if [[ -z "$alias" ]]; then
+		alias=$host
+	else
+		server_pretty="$alias"
+	fi
+
+	snapshots=$( echo $snapshots | sed 's/[^0-9]//g' )
+	[ -z "$snapshots" ] && snapshots=4
+	[ -n "$SNAPSHOT_MULTIPLIER" ] && snapshots=$(( $snapshots * $SNAPSHOT_MULTIPLIER ))
+	recycle=${recycle:-true}
+
+	rsyncdir=$rsyncroot/$alias
+	cd $rsyncdir || {
+		exit_status=3
+		continue
+	}
+	get_lock
+	sshcontrolpath=$rsyncdir/sshctl
+	sshopt="$sshopt -o ControlPath=$sshcontrolpath"
+	sshopt="$sshopt -o UserKnownHostsFile=$confroot/known_hosts"
+
+	echo -e "Backing up $server_pretty - starting: $(echo_current_timestamp)\n"
+	server_run_status=0
+	serverstart=$( date +%-s )
+	send_timeline_event "${server_pretty}_backup-${serverstart}-${mypid}" "Backup of $server_pretty" start
+
+	if [ "$FS" = "btrfs" ]; then
+		# Prepare working subvolume snapshot (but leave any existing one there to build on aborted past runs)
+		workdir=snapshot.work
+		havevol=
+		subvolume_status=$( btrfs subvolume show $workdir 2>/dev/null )
+		if [[ $? -ne 0 ]]; then
+			btrfs subvolume delete $workdir 2>/dev/null
+			# Remove any bogus existing file or directory that is in the way
+			rm -rf $workdir
+			# Find newest snapshot to use as base
+			basesnap=$( ls -1r | grep '^snapshot\.' | head -n 1 )
+			neednewvol=1
+			if [[ -n "$basesnap" && -d "$basesnap" ]]; then
+				btrfs subvolume snapshot $basesnap $workdir && neednewvol=
+			fi
+			[[ -n "$neednewvol" ]] && btrfs subvolume create $workdir
+			btrfs subvolume show $workdir >/dev/null
+			[[ $? -eq 0 ]] && havevol=1
+		else
+			havevol=1
+		fi
+		if [[ -z "$havevol" ]]; then
+			echo "Unable to create btrfs subvolume to rsync into!"
+			die 2
+		fi
+	elif [ "$FS" = "zfs" ]; then
+		workdir=snapshot.work
+		# Ensure zfs filesystem in place (but leave any existing one there to build on aborted past runs)
+		havevol=
+		subvolume_status=$( zfs list $zfspool/$alias 2>/dev/null )
+		if [[ $? -ne 0 ]]; then
+			# Create base volume
+			zfs create -o mountpoint=$rsyncdir/$zfsbase $zfspool/$alias
+			if [[ $? -ne 0 ]]; then
+				echo "Unable to create zfs filesystem to rsync into!"
+				die 2
+			fi
+		fi
+		# Remove any bogus existing file or directory that is in the way
+		rm -rf $workdir
+		rm -f $zfsbase/backup.log $zfsbase/du.txt $zfsbase/index.txt.xz $zfsbase/test.log 2>/dev/null
+		# workdir is a sentinel that backups are in progress
+		ln -s $zfsbase $workdir
+	else # FS = traditional
+		workdir=rsync.work
+		# sometimes things get a little crazy and an empty file is left
+		# in place of a working directory. Remove this first, if found.
+		[ -f $workdir ] && rm -f $workdir
+		# now set up a working directory if there is none.
+		if [[ ! -d $workdir ]]; then
+			if [[ "$recycle" == "true" && -d rsync.$snapshots ]]; then
+				mv $chatty rsync.$snapshots $workdir
+			else
+				mkdir $workdir
+			fi
+		fi
+	fi
+
+	source=$rsyncuser@$server::endpoint_backup
+	export RSYNC_PASSWORD=$rsyncpass
+
+	conn="-e 'ssh -C -l $sshuser $sshopt' --partial --timeout=3600"
+
+	incoverride=
+	[ -s "$confdir/$type-override" ] && incoverride="--include-from=$confdir/$type-override"
+	exclude=
+	[ -s "$confdir/$type-exclude" ] && exclude="--exclude-from=$confdir/$type-exclude"
+	[ -n "$global_exclude" ] && exclude="$exclude --exclude-from=$confroot/$global_exclude"
+
+	[ "$FS" = "traditional" ] && opts="-aH -S --numeric-ids -R --delete-during --delete-excluded --link-dest=../rsync.0 $rsyncopts"
+	[ "$FS" = "btrfs" -o "$FS" = "zfs" ] && opts="-aH --inplace --numeric-ids -R --delete-before --delete-excluded --no-whole-file $rsyncopts"
+	[ -n "$dryrun" ] && opts="--dry-run $opts"
+	[ -n "$bwlimit" ] && opts="$opts --bwlimit $bwlimit"
+
+	if [ -e "$sshcontrolpath" ]; then
+		ssh -l $sshuser $sshopt -O exit $server 2>/dev/null
+		rm -f "$sshcontrolpath"
+	fi
+	ssh -MNf -C -l $sshuser $sshopt $server
+	allok=1
+	set -f
+	for remote in `grep -v '^[[:space:]]*#\|^[[:space:]]*$' $confdir/$type-include`
+	do
+		cmd="rsync $conn $opts $incoverride $exclude $extra $source$remote $workdir"
+		echo "Backing up $remote"
+		if [ "$verbose" -ge 3 -o -n "$dryrun" ]; then
+			echo $cmd
+		fi
+
+		success=
+		remotestart=$( date +%-s )
+		for (( attempts=0 ; attempts <= $retries ; attempts++ ))
+		do
+			if [ -n "$retrywait" -a $attempts -gt 0 ]; then
+				echo "Sleeping $retrywait seconds before trying again"
+				sleep $retrywait
+			fi
+			eval $cmd
+			err=$?
+			if [ $err -eq 0 -o $err -eq 24 ]; then
+				touch $workdir
+				success=1
+				break
+			elif [ $err -eq 23 -a -n "$unreadable_ok" ]; then
+				touch $workdir
+				success=1
+				break
+			elif [ $err -eq 20 ]; then
+				die 2
+			fi
+		done
+		remoteend=$( date +%-s )
+		remotetotal=$( calctime $remotestart $remoteend )
+
+		if [ -z "$success" ]; then
+			echo "Maximum failure count reached; skipping. [$remotetotal min.]"
+			allok=
+			let "server_run_status += 1"
+		elif [ "$verbose" -ge 1 ]; then
+			echo "Backed up $remote in $remotetotal min."
+		fi
+		[ "$verbose" -ge 3 ] && echo -e "\n"
+	done
+
+	echo -e "Removing any paths not in the backup set"
+	cmd="find $workdir/"
+	parent_paths=
+	backup_everything=
+	for remote in `grep -v '^[[:space:]]*#\|^[[:space:]]*$' $confdir/$type-include`
+	do
+		if [ "$remote" = "/" ]; then backup_everything="1"; fi
+		cmd="$cmd -wholename $workdir${remote%/} -prune -o"
+		# TODO: Be a little more forgiving in case a path doesn't start with /
+		remote=`dirname "$remote"`
+		while [ "$remote" != "/" ]; do parent_paths="$parent_paths $remote"; remote=`dirname "$remote"`; done
+	done
+	for parent_path in $parent_paths; do
+		cmd="$cmd -not -wholename $workdir$parent_path -a"
+	done
+	cmd="$cmd -not -wholename $workdir/"
+	# Only run if it makes sense to
+	if [ -z "$backup_everything" ]; then
+		$cmd -print
+		[ -z "$dryrun" ] && $cmd -print0 | xargs -0 rm -rf
+	else
+		echo "All paths are in backup set, skipping"
+	fi
+
+	set +f
+	ssh -l $sshuser $sshopt -O exit $server 2>/dev/null
+
+	if [ -z "$dryrun" -a x$allok = x1 ]; then
+		if [[ "${INDEX_BACKUPS:-true}" == "true" ]]; then
+			echo -e "Indexing latest $server_pretty snapshot"
+			indexstart=$( date +%-s )
+			if pushd $workdir >/dev/null; then
+				find . | cut -b3- | grep . | xz > index.txt.xz &
+				du -shc * > du.txt
+				wait
+				if [[ -f "../rsync.0/index.txt.xz" ]]; then
+					diff -u <(xzcat ../rsync.0/index.txt.xz | sort) <(xzcat index.txt.xz | sort) > index.txt.diff
+				fi
+				popd >/dev/null
+			else
+				echo -e "Couldn't cd $workdir"
+			fi
+			indexend=$( date +%-s )
+			indextotal=$( calctime $indexstart $indexend )
+			echo -e "Indexing latest $server_pretty snapshot took $indextotal minutes"
+			send_timeline_event "${server_pretty}_index-${indexstart}-${mypid}" "Indexing latest $server_pretty snapshot" end
+		fi
+
+		echo -e "\nRemoving old $server_pretty snapshots (keeping up to $snapshots)"
+		rotatestart=$( date +%-s )
+		send_timeline_event "${server_pretty}_rotate-${rotatestart}-${mypid}" "Removing old $server_pretty snapshots" start
+		if [ "$FS" = "btrfs" ]; then
+			snaptime=$( date --rfc-3339=ns | sed 's/ /T/; s/\.[0-9][0-9]*//; s/+00:00$/Z/' )
+			snapname="snapshot.$snaptime"
+			mv $workdir $snapname
+			ln -snf $snapname current
+			btrfs property set -ts $snapname ro true
+			for olddir in $( ls -1r | grep '^snapshot\.[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z$' | tail -n +$(( 1 + $snapshots )) ); do
+				echo -e "Removing snapshot $olddir"
+				btrfs subvolume delete $olddir
+				rm -rf $olddir   # just in case; should be a no-op
+			done
+		elif [ "$FS" = "zfs" ]; then
+			snaptime=$( date --rfc-3339=ns | sed 's/ /T/; s/\.[0-9][0-9]*//; s/+00:00$/Z/' )
+			rm -f $workdir
+			zfs snapshot $zfspool/$alias@$snaptime
+			ln -s $zfsbase/.zfs/snapshot/$snaptime ./snapshot.$snaptime
+			for oldsnap in $( zfs list -Hrt snapshot $zfspool/$alias | sort -r | grep -o '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z' | tail -n +$(( 1 + $snapshots )) ); do
+				echo -e "Removing snapshot $oldsnap"
+				zfs destroy $zfspool/$alias@$oldsnap
+				rm -f snapshot.$oldsnap # clean up symlink
+			done
+		else # FS = traditional
+			chatty=
+			[ "$verbose" -ge 2 ] && chatty="-v"
+			i=$snapshots
+			while [ -d rsync.$i ]; do
+				[ "$verbose" -ge 2 ] && echo "Removing rsync.$i"
+				rm -rf rsync.$i
+				let ++i
+			done
+			for (( i=$snapshots ; i >= 0 ; --i )); do
+				[ -d rsync.$i ] && mv $chatty rsync.$i rsync.$(( $i + 1 ))
+			done
+			mv $chatty $workdir rsync.0
+		fi
+		send_timeline_event "${server_pretty}_rotate-${rotatestart}-${mypid}" "Removing old $server_pretty snapshots" end
+		rotateend=$( date +%-s )
+		rotatetotal=$( calctime $rotatestart $rotateend )
+		echo -e "Removing old $server_pretty snapshots took $rotatetotal minutes"
+
+		echo -e "\nTesting latest $server_pretty snapshot"
+		teststart=$( date +%-s )
+		$backuproot/bin/backup-test $alias
+		test_run_status=$?
+		send_timeline_event "${server_pretty}_backup-${teststart}-${mypid}" "Testing $server_pretty" end $test_run_status
+		testend=$( date +%-s )
+		testtotal=$( calctime $teststart $testend )
+		echo -e "Testing latest $server_pretty snapshot took $testtotal minutes"
+
+		send_timeline_event "${server_prety}_backup-${serverstart}-${mypid}" "Backup of $server_pretty" end $server_run_status
+		serverend=$( date +%-s )
+		servertotal=$( calctime $serverstart $serverend )
+		echo -e "Successfully backed up $server_pretty in $servertotal minutes.\n"
+	else
+		serverend=$( date +%-s )
+		servertotal=$( calctime $serverstart $serverend )
+		send_timeline_event "${server_pretty}_backup-${serverstart}-${mypid}" "Backup of $server_pretty" end $server_run_status
+		echo -n "Not rotating snapshots due to "
+		if [ -n "$dryrun" ]; then 
+			echo -e "dry-run\n"
+		else
+			echo -e "errors\n"
+		fi
+		echo -e "Done trying to back up $server_pretty after $servertotal minutes.\n"
+	fi
+
+	release_lock
+	[ "$verbose" -ge 1 ] && echo && df -m
+	echo
+done
+
+if [ -n "$post_hook" -a -x "$post_hook" ]; then
+	status="failure"
+	if [ x$allok = x1 ]; then
+		status="success"
+	fi
+	[ "$verbose" -ge 3 ] && echo "Going to run:" $post_hook "$server_pretty" $status $post_hook_extra
+	$post_hook "$server_pretty" $status $post_hook_extra
+fi
+
+backupend=$( date +%-s )
+backuptotal=$( calctime $backupstart $backupend )
+echo -e "Finished backup on $hostname: $(echo_current_timestamp) - total backup time: $backuptotal minutes\n"
+die $exit_status
+
+# vim: set noet:

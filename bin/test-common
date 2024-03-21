@@ -1,0 +1,206 @@
+# Response Functions
+
+function test_ok {
+    if [[ $VERBOSE -ge 1 ]]; then
+        echo "ok $*"
+    fi
+}
+function test_fail {
+    if [[ -n $acks ]]; then
+        if echo $* | grep "$acks" > /dev/null; then
+            echo "skip $*"
+            return
+        fi
+    fi
+    echo "fail $*"
+    exit 1
+}
+function test_skip {
+    if [[ $VERBOSE -ge 1 ]]; then
+        echo "skip $*"
+    fi
+}
+function test_exit_status {
+    # Check exit status of previous command
+    # $*: Comment for command that was run
+
+    if [[ $? -gt 0 ]]; then
+        test_fail $*
+    else
+        test_ok $*
+    fi
+}
+
+# Allow some failures to be ignored
+function ack_failure {
+    acks="$acks${acks+\\|}$*"
+}
+
+# Supporting Functions
+
+function relpath {
+    # Assume absolute paths are actually relative
+
+    if [[ "${1:0:1}" == "/" ]]; then
+        echo "${1:1}"
+    else
+        echo "$1"
+    fi
+}
+
+function readfile {
+    # Read a file from disk, decompressing if needed
+
+    magic=$(/usr/bin/file "$1")
+    if echo $magic | grep gzip > /dev/null; then
+        readcmd=/bin/zcat
+    elif echo $magic | grep bzip2 > /dev/null; then
+        readcmd=/bin/bzcat
+    elif echo $magic | grep XZ > /dev/null; then
+        readcmd=/usr/bin/xzcat
+    elif echo $magic | grep Zstandard > /dev/null; then
+        readcmd=/usr/bin/zstdcat
+    else
+        readcmd=/bin/cat
+    fi
+    $readcmd "$1"
+}
+
+function check_md5sum {
+    # Check a file against its md5sum
+    # $1: File to check
+    # $2: File containing md5sum output (assuming stdin)
+
+    if readfile "$1" | md5sum -c "$2" >/dev/null 2>&1; then
+        return 0;
+    else
+        return 1;
+    fi
+}
+
+function compare_string {
+    if [[ "$1" = "$2" ]]; then
+        return 0;
+    else
+        return 1;
+    fi
+}
+
+function compare_head {
+    # Check header of file against known value
+    # $1: File to read
+    # $2: Value to check
+
+    lines=$(echo "$2" | wc -l)
+    output=$(readfile "$1" | head -n $lines)
+    if compare_string "$output" "$2"; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+function compare_tail {
+    # Check footer of file against known value
+    # $1: File to read
+    # $2: Value to check
+    #
+    # Note: Removes trailing blank lines as bash workaround
+
+    lines=$(echo "$2" | wc -l)
+    output=$(readfile "$1" | sed '/^$/{$ d}' | tail -n $lines)
+    if compare_string "$output" "$2"; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+function file_count {
+    # Return number of files matched by glob or in directory
+    # $*: Paths to check
+
+    if [[ -z "$1" ]]; then
+        echo 0
+        return 0
+    fi
+    find $* 2>/dev/null | wc -l
+    return 1
+}
+
+function file_min_size {
+    # Check whether a file has at least a certain number of bytes
+    # $1: File to check
+    # $2: Minimum number of bytes to match
+
+    if test $(find "$1" -maxdepth 0 -size -${2}c 2>/dev/null); then
+        return 1
+    else
+        return 0
+    fi
+}
+
+function file_recent {
+    # Check whether a file/directory has been modified recently
+    # $1: Path to check
+    # $2: Optional, days since modified, default 2
+
+    if [[ "$2" =~ ^[0-9]+$ ]]; then
+        days=$2
+    else
+        days=2
+    fi
+    if test $(find "$1" -maxdepth 0 -mtime -$days 2>/dev/null); then
+        return 0
+    else
+        return 1
+    fi
+}
+
+function regex_whole {
+    # Check entire file for regular expression match
+    # $1: File to read
+    # $2: Regex to check
+
+    if readfile "$1" | grep "$2" > /dev/null; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+function regex_head {
+    # Check header of file for regular expression match
+    # $1: File to read
+    # $2: Regex to check
+    # $3: Optionally, number of lines to examine, default 1
+
+    if [[ -n $3 ]]; then
+        lines=$3
+    else
+        lines=1
+    fi
+    if readfile "$1" | head -n $lines | grep "$2" > /dev/null; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+function regex_tail {
+    # Check footer of file for regular expression match
+    # $1: File to read
+    # $2: Regex to check
+    # $3: Optionally, number of lines to examine, default 1
+
+    if [[ -n $3 ]]; then
+        lines=$3
+    else
+        lines=1
+    fi
+    if readfile "$1" | tail -n $lines | grep "$2" > /dev/null; then
+        return 0
+    else
+        return 1
+    fi
+}

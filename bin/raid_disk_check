@@ -1,0 +1,14 @@
+#!/bin/bash
+
+# check RAID disks
+
+PATH=/backup/bin:$PATH
+
+if [ -f ../conf/$hostname-config ]; then
+    . ../conf/$hostname-config
+fi
+
+# doing the raid check on only the backup SKIP_DAY
+grep `date +%d` <<< ${SKIP_DAY:-99} -q || exit 1
+echo check > /sys/devices/virtual/block/md127/md/sync_action
+echo "Doing the redundancy check  today, so the backup will be skipped"

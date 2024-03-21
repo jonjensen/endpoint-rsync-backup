@@ -1,0 +1,109 @@
+#!/bin/bash
+
+# verifies that backups are functioning properly
+
+## exit states
+STATE_OK=0
+STATE_WARNING=1
+STATE_CRITICAL=2
+STATE_UNKNOWN=3
+STATE_DEPENDENT=4
+
+## Configuration
+backuproot=/backup
+rsyncroot=$backuproot/rsync
+cd $backuproot/conf || {
+	echo "BACKUP CRITICAL: no dir $backuproot/conf" >&2
+	exit $STATE_CRITICAL
+}
+hostname=`hostname -s`
+servers=( `grep -l "destinations=.*$hostname.*" */backup.conf | cut -d '/' -f 1` )
+
+function calc_perfhigh() {
+	local datas=$@
+	if [[ ${#datas[*]} -gt 0 ]]; then
+		PERF=( $( echo ${datas[@]} | sed -re 's:\ +:\n:g' | grep -v NODIR | sort -n -t':' -k2 ) )
+		if [ ${#PERF[*]} -ge 1 ]; then
+			PERFLAST=$[ ${#PERF[*]} - 1 ]
+			PERFHIGH=${PERF[$PERFLAST]##*:}
+		else
+			PERFHIGH=0
+		fi
+		echo $PERFHIGH
+		return 0
+	else
+		echo 0
+		return 0
+	fi
+}
+
+## variable initialization
+arrnumber=0
+today=`date +%s`
+if [ "${1}x" == "x" ]; then
+	warn_hr_limit=30
+else
+	warn_hr_limit=$1
+fi
+if [ "${2}x" == "x" ]; then
+	crit_hr_limit=48
+else
+	crit_hr_limit=$2
+fi
+
+for server in ${servers[@]}; do
+	# test for at least one rsync directory for the server
+	recentsnap=$( ls -1r $rsyncroot/$server/ | grep "^snapshot\.2" | head -n 1 )
+        if ! [ -n "$recentsnap" -a -d $rsyncroot/$server/"$recentsnap" -a $(df -hT $rsyncroot/$server/"$recentsnap" | awk '{print $2}' | tail -1) == "zfs" ]; then
+                recentsnap="rsync.0"
+        fi
+	
+	if [ -n "$recentsnap" -a -d $rsyncroot/$server/"$recentsnap" ]; then
+		# calculate rounded time in hours since rsync.0 was last modified
+		sync_age=$( echo -n $[ ($today - `stat -c %Y $rsyncroot/$server/"$recentsnap"`) / 60 / 60 ] )
+
+		# add server to list of crtical or warning servers if rsync.0 directory is too old
+		if [ "$sync_age" -ge "$crit_hr_limit" ]; then
+			critservers[$arrnumber]=$server:$sync_age
+			let "arrnumber += 1"
+		elif [ "$sync_age" -ge "$warn_hr_limit" ]; then
+			warnservers[$arrnumber]=$server:$sync_age
+			let "arrnumber += 1"
+		fi
+	else
+		critservers[$arrnumber]=$server:NODIR
+		let "arrnumber += 1"
+	fi
+done
+
+# if any servers have been added to the badservers list, complain and exit.
+if [ "${#critservers[*]}" -gt "0" ]; then
+	echo -n "BACKUP CRIT: "
+	for server in ${critservers[@]}; do
+		echo -n "["$server" hrs] "
+	done
+	if [ "${#warnservers[*]}" -gt "0" ]; then
+		echo -n ".additional warnings. "
+		for server in ${warnservers[@]}; do
+			echo -n "["$server" hrs] "
+		done
+	fi
+	PERFVAL=$( calc_perfhigh "${critservers[@]} ${warnservers[@]}" )
+	echo "|age=$PERFVAL;$warn_hr_limit;$crit_hr_limit;0;0"
+	exit $STATE_CRITICAL
+elif [ "${#warnservers[*]}" -gt "0" ]; then
+	echo -n "BACKUP WARN: "
+	for server in ${warnservers[@]}; do
+		echo -n "["$server" hrs] "
+	done
+	PERFVAL=$( calc_perfhigh "${warnservers[@]}" )
+	echo "|age=$PERFVAL;$warn_hr_limit;$crit_hr_limit;0;0"
+	exit $STATE_WARNING
+else
+	echo -n "BACKUP OK"
+	echo "|age=0;$warn_hr_limit;$crit_hr_limit;0;0"
+	exit $STATE_OK
+fi
+
+# calculate age in seconds between rsync.0 and rsync.1
+# sync_difference=$( echo $[`stat -c %Y $rsyncroot/$server/rsync.0` - `stat -c %Y $rsyncroot/$server/rsync.1`] )

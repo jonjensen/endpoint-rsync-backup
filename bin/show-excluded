@@ -1,0 +1,113 @@
+#!/bin/bash
+
+# show-excluded
+# Analyze the config for a server, and show the excluded paths currently there
+# by Josh Williams <jwilliams@endpointdev.com>
+
+set -o noglob
+
+# Arrays for holding path info
+declare -a includes
+declare -a excludes_absolute
+declare -a excludes_relative
+
+backuproot=/backup
+confroot="$backuproot/conf"
+
+VERBOSE=0
+while getopts v opts; do
+    if [[ "$opts" = "v" ]]; then
+        VERBOSE=$(($VERBOSE + 1))
+    fi
+done
+shift $(($OPTIND - 1))
+
+# Take only a single server in the command line at the moment
+if [[ -z $1 ]]; then
+    echo Error: no server specified >&2
+    exit 1
+fi
+server=$1
+
+# Trim off any domain name part to get the confdir
+host=`echo $server | sed 's:\..*::'`
+
+confdir="$confroot/$host"
+
+if [[ ! -d $confdir ]]; then
+    echo "Error: Unable to find the conf directory for $server, expected at $confdir" >&2
+    exit 2
+fi
+
+conffile="$confdir/backup.conf"
+if [[ -s $conffile ]]; then
+    . $conffile
+fi
+
+# Read in includes and excludes lines
+#grep -v '^#' $confdir/daily-include | while IFS= read -r pathline; do
+for pathline in $(grep -v '^#' $confdir/daily-include); do
+    includes+=( "$pathline" )
+done
+
+#grep -v '^#' $confdir/daily-exclude | while IFS= read -r pathline; do
+for pathline in $(grep -v '^#' $confdir/daily-exclude); do
+    # Remove any trailing slash from exclude lines
+    pathline=${pathline%/}
+
+    # Absolute versus relative path exclude options
+    if [[ ${pathline:0:1} == "/" ]]; then
+        # Validate there's an include path that covers the excluded absolute path
+        path_matched=0
+        for include_path in ${includes[@]}; do
+            if [[ $pathline == ${include_path}* ]]; then
+                path_matched=1
+            fi
+        done
+        if [[ $path_matched -eq 0 ]]; then
+             echo "Warning: Excluded absolute path $pathline is not contained in any included path"
+        else
+             excludes_absolute+=($pathline)
+        fi
+    else
+        excludes_relative+=($pathline)
+    fi
+done
+
+# Construct the find command to execute on the remote system
+remote_find="find"
+for include_path in ${includes[@]}; do
+    remote_find="$remote_find $include_path"
+done
+
+# Don't traverse filesystem mounts, like we tell rsync not to
+remote_find="$remote_find -xdev"
+first_exclude=1
+
+# Absolute paths we can match directly, assuming we've validated them above
+for exclude_path in ${excludes_absolute[@]}; do
+    if [ $first_exclude -eq 1 ]; then
+        first_exclude=0
+    else
+        remote_find="$remote_find -o"
+    fi
+    remote_find="$remote_find -path '$exclude_path' -prune"
+done
+
+# Relative paths we need to tell find it can match anywhere
+for exclude_path in ${excludes_relative[@]}; do
+    if [ $first_exclude -eq 1 ]; then
+        first_exclude=0
+    else
+        remote_find="$remote_find -o"
+    fi
+    remote_find="$remote_find -path '*/$exclude_path' -prune"
+done
+
+if [ $VERBOSE -ge 1 ]; then
+    echo "Constructed find command:"
+    echo $remote_find
+fi
+
+echo "Finding excluded paths currently on $server:"
+ssh -o UserKnownHostsFile=$confroot/known_hosts root@$host.$domain $remote_find

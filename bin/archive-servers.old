@@ -1,0 +1,54 @@
+#!/bin/bash
+
+# archive-servers.old
+# Find systems in servers.old and move to servers.archive
+# by Josh Williams <jwilliams@endpointdev.com>
+
+trap "exit 0" INT
+
+backuproot=/backup
+rsyncroot="$backuproot/rsync"
+oldroot="$rsyncroot/servers.old"
+archiveroot="$rsyncroot/servers.archive"
+
+cd $oldroot || exit 1
+if [ ! -e "$archiveroot" ]; then exit 0; fi
+
+lockfile=/var/run/archive-servers.old.lock
+function cleanup {
+    if [[ -s "$lockfile" ]]; then
+        if [[ "$curlock" = "$$" ]]; then
+            rm -f $lockfile
+            return 0
+        fi
+    fi
+}
+trap 'cleanup' EXIT INT
+# Check for a lock from a previous run
+if [[ -s "$lockfile" ]]; then
+    curlock=$( cat $lockfile )
+    if [[ "$curlock" != "$$" ]]; then
+        # This might take a while, and if a previous invocation is still
+        # running, that's fine. We'll bail, let that finish, and see if
+        # there's anything more to do next time around.
+        if ( kill -0 $curlock 2>&1 )>/dev/null; then
+            exit 0
+        fi
+    fi
+fi
+echo -n $$ >$lockfile
+
+# If interrupted, continue removing any archived servers.old remnants
+ionice -c 3 rm -rf $oldroot/rmthis.* 2>/dev/null
+
+# Look for any non-linked servers that had been moved to servers.old
+find * -maxdepth 0 -type d -print0 | xargs -0 -r -n1 -I{} sh -ec '
+    # Again, if interrupted, clear out previous attempt and redo archive move
+    ionice -c 3 rm -rf ../servers.archive/"{}" 2>/dev/null
+    # Archive server.old contents
+    ionice -c 3 cp -a "{}" ../servers.archive/"{}"
+    # Mark what has now been successfully moved and start the delete
+    mv "{}" "rmthis.{}"
+    ln -s ../servers.archive/"{}" "{}"
+    ionice -c 3 rm -rf "rmthis.{}"
+'

@@ -1,0 +1,108 @@
+#!/bin/bash
+
+# backup-test
+# Perform some rudimentary automated tests on backups
+# by Josh Williams <jwilliams@endpointdev.com>
+
+# Paths and helper functions
+libdir="$(dirname "$0")"
+. "$libdir/test-common"
+. "$libdir/test-tests"
+
+backuproot=/backup
+rsyncroot="$backuproot/rsync"
+confroot="$backuproot/conf"
+
+hostname=$(hostname -s)
+FS=traditional
+if [ -f $confroot/$hostname-config ]; then
+    . $confroot/$hostname-config
+fi
+
+VERBOSE=0
+while getopts v opts; do
+    if [ "$opts" = "v" ]; then
+        VERBOSE=$(($VERBOSE + 1))
+    fi
+done
+shift $(($OPTIND - 1))
+
+# Since we exit on first fail, take only a single server in the command line
+if [ -z $1 ]; then
+    echo Error: no server specified >&2
+    exit 1
+fi
+
+# Support taking a batch name argument, and run self to test each server
+if [ -f $confroot/$1 -a -s $confroot/$1 ]; then
+    for server in $(grep -v '^[[:space:]]*#\|^[[:space:]]*$' $confroot/$1); do
+        if [[ $VERBOSE -ge 1 ]]; then
+            v="-v"
+            echo Testing $server
+        fi
+        "$0" $v $server
+    done
+    exit 0
+fi
+
+# Otherwise...
+server=$1
+
+# Trim off any domain name part
+alias=
+host=`echo $server | sed 's:\..*::'`
+
+# Look for a host alias, just in case
+confdir="$confroot/$host"
+conffile="$confdir/backup.conf"
+
+if [ -f $conffile -a -s $conffile ]; then
+    . $conffile
+fi
+[ -z "$alias" ] && alias=$host
+
+if [ -d "$rsyncroot/$alias/rsync.work/" -o -d "$rsyncroot/$alias/snapshot.work/" ]; then
+    echo Previous $server backup may not have completed or is still in progress >&2
+    exit 1
+fi
+
+if [ "$FS" = "btrfs" ]; then
+	recentsnap=$( ls -1r $rsyncroot/$alias/ | grep "^snapshot\." | head -n 1 )
+	btrfs property get -ts "$rsyncroot/$alias/$recentsnap" ro | grep -q true
+	snapro=$?
+	[ $snapro -eq 0 ] && btrfs property set -ts "$rsyncroot/$alias/$recentsnap" ro false
+
+	cd "$rsyncroot/$alias/$recentsnap/" || exit 1
+elif [ "$FS" = "zfs" ]; then
+	recentsnap=$( zfs list -Hrt snapshot $zfspool/$alias | sort -r | grep -o '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z' | head -n 1 )
+	zfs rollback $zfspool/$alias@$recentsnap
+
+	cd "$rsyncroot/$alias/$zfsbase/" || exit 1
+else # FS = traditional
+	cd "$rsyncroot/$alias/rsync.0/" || exit 1
+fi
+
+testconf="$confdir/tests.conf"
+function save_log {
+	if [ "$FS" = "btrfs" ]; then
+		[ $snapro -eq 0 ] && btrfs property set -ts "$rsyncroot/$alias/$recentsnap" ro true
+	elif [ "$FS" = "zfs" ]; then
+		# Recreate snapshot with test.log in place
+		# Ensures that only test.log has changed ... but is surprisingly time consuming
+		# TODO: Come up with a better solution
+		if [[ $( zfs diff $zfspool/$alias@$recentsnap | egrep -v 'current/(|test.log)$' | wc -l ) -ge 1 ]]; then
+			echo "More than test.log changed in snapshot, not saving."
+		else
+			zfs destroy $zfspool/$alias@$recentsnap
+			zfs snapshot $zfspool/$alias@$recentsnap
+		fi
+	fi
+}
+trap save_log EXIT
+
+# Run the test functions and log to snapshot
+if [[ $VERBOSE -ge 1 ]]; then
+    . "$testconf" | tee test.log
+else
+    . "$testconf" > test.log
+fi

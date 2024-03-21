@@ -1,0 +1,72 @@
+#!/bin/bash
+
+# Initiates the backup process
+
+trap "exit 2" INT
+
+PATH=/backup/bin:$PATH
+
+cd /backup/reports || exit 1
+hostname=$(hostname -s)
+
+reportname="$(date +%Y-%m-%d).txt"
+
+# Defaults
+PARALLELIZATION=3
+FS=traditional
+if [ -f ../conf/$hostname-config ]; then
+    . ../conf/$hostname-config
+fi
+export FS zfspool zfsbase
+
+# skipping the backup on SKIP_DAY of every month to do the raid disk check
+grep -v `date +%d` <<< ${SKIP_DAY:-99} -q || exit 1
+
+# Safety checks
+[ "$FS" = "zfs" ] && ( zpool status $zfspool >/dev/null 2>&1 || exit 2 )
+
+# Free up I/O for backups
+killall killable-space-scanner 2>/dev/null
+
+# clear out camps, and wait till done
+#[ "$FS" = "traditional" ] && (date; df -h; clear_out_old_camps.pl; clear_out_old_bayes_databases.pl; date; df -h) &>> $reportname
+
+# kick off backups in parallel
+echo "Starting $hostname backup run at `date`" >> $reportname
+grep -l "destinations=.*$hostname.*" $(cat <(grep '^priority=' ../conf/*/backup.conf | sort -t= -k2 -n | cut -d ':' -f 1) <(grep -L '^priority=' ../conf/*/backup.conf)) | cut -d '/' -f 3 | \
+    xargs -r -I{} -P$PARALLELIZATION sh -c '
+        echo "Backup of {} starting `date`"
+        PATH=/backup/bin:$PATH
+        alias=`echo {} | sed "s:\..*::"`
+        conffile="/backup/conf/$alias/backup.conf"
+        if [ -s $conffile ]; then
+            . $conffile
+        fi
+        backuproot="/backup/rsync/$alias"
+        backup-rsync -r 3 -v 1 {} >> $backuproot/backup.log 2>&1
+        if [ "$FS" = "traditional" -a ! -d $backuproot/rsync.work ]; then
+            mv $backuproot/backup.log $backuproot/rsync.0/
+        elif [ "$FS" = "btrfs" -a ! -d $backuproot/snapshot.work ]; then
+            # TODO: More deterministic way to get snapshot name from backup-rsync
+            recentsnap=$( ls -1r $backuproot | grep "^snapshot\." | head -n 1 )
+            btrfs property get -ts "$backuproot/$recentsnap" ro | grep -q true
+            snapro=$?
+            [ $snapro -eq 0 ] && btrfs property set -ts "$backuproot/$recentsnap" ro false
+            [ -d "$backuproot/$recentsnap/" ] && mv $backuproot/backup.log "$backuproot/$recentsnap/"
+            [ $snapro -eq 0 ] && btrfs property set -ts "$backuproot/$recentsnap" ro true
+        elif [ "$FS" = "zfs" -a ! -L $backuproot/snapshot.work ]; then
+            # TODO: More deterministic way to get snapshot name from backup-rsync
+            recentsnap=$( zfs list -Hrt snapshot $zfspool/$alias | sort -r | grep -o "[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z" | head -n 1 )
+            zfs rollback $zfspool/$alias@$recentsnap
+            mv $backuproot/backup.log "$backuproot/$zfsbase/"
+            zfs destroy $zfspool/$alias@$recentsnap || ( lsof $backuproot/$zfsbase/.zfs/snapshot/$recentsnap & zfs holds $zfspool/$alias@$recentsnap )
+            zfs snapshot $zfspool/$alias@$recentsnap
+        fi
+        echo "Backup of {} completed `date`"
+    ' >> $reportname
+echo "Backup run on $hostname complete at `date`" >> $reportname
+
+# Start background space scanner process
+[ "$FS" = "traditional" ] && ( archive-servers.old; killable-space-scanner 2>/dev/null & disown )
+[ "$FS" = "btrfs" ] && btrfs scrub start /backup
+#[ "$FS" = "zfs" ] && zpool scrub $zfspool 2>/dev/null

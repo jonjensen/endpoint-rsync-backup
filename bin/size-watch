@@ -1,0 +1,19 @@
+#!/bin/bash
+
+die() {
+	echo $@
+	exit 1
+}
+
+for base in /mirrors /roomy
+do
+	cd $base
+	for server in *
+	do
+		cd $base/$server || die "Couldn't cd $base/$server"
+		dir=rsync.0
+		[ -d $dir ] || continue
+		echo -n "$server: "
+		du -ks $dir | awk '{print $1}'
+	done
+done

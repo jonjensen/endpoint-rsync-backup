@@ -1,0 +1,24 @@
+#!/bin/bash
+
+# displays the backup batches for easy human-review
+
+CONFDIR=/backup/conf
+
+for batch in $CONFDIR/batch*
+do
+	echo -n "== hosts:"; wc -l $batch;
+	cat $batch
+	echo
+done
+
+hostname=`hostname -s`
+for server in `cat $CONFDIR/batch? $CONFDIR/$hostname-only`
+do
+	if ( ! grep -q $server $CONFDIR/batch* ); then
+		missing="${missing}${server}\n"
+	fi
+done
+if [ ! -z $missing ]; then
+	echo "Servers in \"all-servers\" which are not in a batch:"
+	echo -en $missing
+fi

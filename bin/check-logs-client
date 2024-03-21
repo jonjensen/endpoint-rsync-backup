@@ -1,0 +1,26 @@
+#!/bin/bash
+
+# verify backups for specific client
+
+set -euo pipefail
+IFS=$'\n\t'
+trap 'exit 1' INT
+
+recipient_email="user@domain.com"
+
+backup_base=/backup/rsync/$server_name
+current_dir=rsync.0
+path=/var/log/servers
+cd "$backup_base/$current_dir$path"
+
+sum_file=/backup/reports/client-logs-sha256sums
+
+# Yesterday's sums are for files which have since then likely been moved to rsync.1
+# Check those sums against today's new backup in rsync.0
+if [[ -e "$sum_file" ]]; then
+	cron-harness -e $recipient_email \
+		sha256sum --check --strict --quiet --ignore-missing "$sum_file"
+fi
+
+# Now overwrite the checksum file with results from today's backups
+find 2[0-9][0-9][0-9] -type f -mtime +2 -print0 | xargs -0 sha256sum > "$sum_file"

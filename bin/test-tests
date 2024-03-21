@@ -1,0 +1,188 @@
+# Group/Macro tests
+
+function common_tests {
+    # All servers should pass these routinely
+    etc_present
+    exists usr/local/bin -d
+    if [[ -d var/log ]]; then
+        recently_modified var/log 9
+    else
+        test_skip /var/log not present
+    fi
+    mysql_detect
+    postgres_detect
+}
+
+function etc_present {
+    if [[ ! -e etc/hosts ]]; then
+        test_fail /etc/hosts not present
+    fi
+    if [[ ! -d etc/ssh ]]; then
+        test_fail /etc has no ssh/
+    fi
+    test_ok /etc looks good
+}
+
+# File tests
+
+# TODO: Detect and fix non-relative paths
+
+function exists {
+    # $2 can be a test operator, defaults -e (path can be anything)
+    # But could be -f (regular file), -d (directory), -x (executable), etc
+    if [[ -z $2 ]]; then
+        operator="-e"
+    else
+        operator="$2"
+    fi
+
+    if [ $operator "$1" ]; then
+        test_ok /$1 good
+    else
+        test_fail /$1 not present
+    fi
+}
+
+function min_size {
+    exists "$1" -f
+    file_min_size "$1" $2
+    test_exit_status /$1 at least $2 bytes
+}
+
+function recently_modified {
+    exists "$1"
+    most_recent_in_list="$(ls -dt $@ 2>/dev/null | head -n 1)"
+    file_recent "$most_recent_in_list" ${@: -1}
+    test_exit_status /$most_recent_in_list recent modification date
+}
+
+# Database tests
+
+function mysql_backups {
+    # Check an End Point standard MySQL backup directory
+    # Validates header and footer on each backup file to
+    # ensure files are complete.
+    #
+    # $1: Directory to check
+
+    shopt -s nullglob
+    if [[ ! -d "$1" ]]; then
+        test_fail mysql_backups: "'$1'" is not a directory
+    fi
+
+    # Database files
+    MYSQL_HEADER="^-- \(MySQL\|MariaDB\) dump"
+    MYSQL_FOOTER="^-- Dump completed"
+
+    for backup in "$1"/*.sql.gz "$1"/*.sql.bz2 "$1"/*.sql.xz "$1"/*.sql.zst; do
+        regex_head "$backup" "$MYSQL_HEADER"
+        test_exit_status $backup MySQL header
+        file_recent "$backup" 7
+        if [ $? -eq 0 ]; then
+            regex_tail "$backup" "$MYSQL_FOOTER"
+            test_exit_status $backup MySQL footer
+            if [[ -f "${backup%.*}.md5sum" ]]; then
+                check_md5sum "$backup" "${backup%.*}.md5sum"
+                test_exit_status $backup md5sum
+            fi
+        else
+            test_skip $backup content, not recently changed
+        fi
+    done
+    if [[ $(file_count "$1"/*-mysql-success.txt) -gt 1 ]]; then
+        test_fail multiple success markers in $1
+    fi
+    file_recent "$1"/*-mysql-success.txt
+    test_exit_status mysql_backups: $1 recent success marker file
+
+    if [[ $(file_count "$1"/*.work) -gt 0 ]]; then
+        test_fail .work files found in $1
+    fi
+}
+
+function mysql_detect {
+    # A quick check to try to detect if MySQL is running and if so
+    # that we have tests for it defined.
+    #        CentOS                        Ubuntu
+    if [[ -f "etc/logrotate.d/mysql" || -h "etc/systemd/system/multi-user.target.wants/mysql.service" || -h "etc/systemd/system/multi-user.target.wants/mariadb.service" ]]; then
+        regex_whole "$testconf" "^mysql_backups"
+        test_exit_status MySQL service detected but no tests defined
+    fi
+}
+
+function postgres_backups {
+    # Check an End Point standard Postgres backup directory
+    # Validates header and footer on each backup file,
+    # and md5sum if available
+    #
+    # $1: Directory to check
+
+    shopt -s nullglob
+    if [[ ! -d "$1" ]]; then
+        test_fail postgres_backups: "'$1'" is not a directory
+    fi
+
+    # Database files
+    POSTGRES_HEADER="--
+-- PostgreSQL database dump
+--"
+    POSTGRES_FOOTER="--
+-- PostgreSQL database dump complete
+--"
+
+    for backup in "$1"/*.sql.gz "$1"/*.sql.bz2 "$1"/*.sql.xz "$1"/*.sql.zst; do
+        compare_head "$backup" "$POSTGRES_HEADER"
+        test_exit_status $backup Postgres header
+        file_recent "$backup" 7
+        if [ $? -eq 0 ]; then
+            compare_tail "$backup" "$POSTGRES_FOOTER"
+            test_exit_status $backup Postgres footer
+            if [[ -f "${backup%.*}.md5sum" ]]; then
+                check_md5sum "$backup" "${backup%.*}.md5sum"
+                test_exit_status $backup md5sum
+            fi
+        else
+            test_skip $backup content, not recently changed
+        fi
+    done
+
+    # Database users and other global things
+    POSTGRES_HEADER="--
+-- PostgreSQL database cluster dump
+--"
+    POSTGRES_FOOTER="--
+-- PostgreSQL database cluster dump complete
+--"
+
+    if [[ -n $(shopt -s nullglob; echo "$1"/*GLOBAL.sql) ]]; then
+        for backup in "$1"/*GLOBAL.sql; do
+            compare_head "$backup" "$POSTGRES_HEADER"
+            test_exit_status $backup Postgres cluster globals header
+            compare_tail "$backup" "$POSTGRES_FOOTER"
+            test_exit_status $backup Postgres cluster globals footer
+        done
+    else
+    # TODO: Make a failure?
+        test_skip No global backup found
+    fi
+
+    if [[ $(file_count "$1"/*-mysql-success.txt) -gt 1 ]]; then
+        test_fail multiple success markers in $1
+    fi
+    file_recent "$1"/*-pgsql-success.txt
+    test_exit_status pgsql_backups: $1 recently successful marker file
+
+    if [[ $(file_count "$1"/*.work) -gt 0 ]]; then
+        test_fail .work files found in $1
+    fi
+}
+
+function postgres_detect {
+    # A quick check to try to detect if Postgres is running and if so
+    # that we have tests for it defined.
+    #        CentOS                       Ubuntu
+    if [[ -e "etc/sysconfig/pgsql" || -e "etc/postgresql" ]]; then
+        regex_whole "$testconf" "^postgres_backups"
+        test_exit_status Postgres service detected but no tests defined
+    fi
+}

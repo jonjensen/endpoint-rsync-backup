@@ -1,0 +1,51 @@
+#!/bin/bash
+
+# mkbackup
+# Create backup structures, taking backup server differences into account
+# by Josh Williams <jwilliams@endpointdev.com>
+
+# TODO: Maybe take long arguments, --volume batchN, --conf
+
+set -e
+set -o pipefail
+
+hostname=$(hostname -s)
+backuproot=/backup
+rsyncroot="$backuproot/rsync"
+confroot="$backuproot/conf"
+
+function mkbackup_traditional {
+    # On newer ext4 systems we're trying to do away with the subvolume structure
+    if [ -e $rsyncroot/batch1 ]; then
+        [ -z "$2" ] && ( echo "Need subvolume name as second argument"; exit 1 )
+        mkdir $rsyncroot/$2/$1
+        ln -s $2/$1 $rsyncroot/$1
+    else
+        mkdir $rsyncroot/$1
+    fi
+}
+
+function mkbackup_btrfs {
+    # TODO: If we ever resurrect btrfs
+    echo "ENOTIMPLEMENTED"
+    exit 1
+}
+
+function mkbackup_zfs {
+    mkdir $rsyncroot/$1
+    zfs create -o mountpoint=$rsyncroot/$1/current $zfspool/$1
+}
+
+function mkbackup_system {
+    # TODO: Optionally copy in a skel conf dir if not present?
+
+    mkbackup_$FS $1 $2
+}
+
+# Read server config after function definition, allow for overrides
+FS=traditional
+if [ -f $confroot/$hostname-config ]; then
+    . $confroot/$hostname-config
+fi
+
+mkbackup_system $1 $2

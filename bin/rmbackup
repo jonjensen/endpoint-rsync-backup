@@ -1,0 +1,71 @@
+#!/bin/bash
+
+# rmbackup
+# Move a system to servers.old, taking backup server differences into account
+# by Josh Williams <jwilliams@endpointdev.com>
+
+set -e
+set -o pipefail
+
+hostname=$(hostname -s)
+backuproot=/backup
+rsyncroot="$backuproot/rsync"
+confroot="$backuproot/conf"
+
+function cleanup_traditional {
+    # On newer ext4 systems we're trying to do away with the subvolume structure
+    if [ -e $rsyncroot/batch1 ]; then
+        vol=`readlink $rsyncroot/$1 | sed 's:/.*::'`
+        mv $rsyncroot/$vol/$1 $rsyncroot/$vol/servers.old/$1
+        rm -f $rsyncroot/$1
+        ln -s ../$vol/servers.old/$1 $rsyncroot/servers.old/$1
+    else
+        mv $rsyncroot/$1 $rsyncroot/servers.old/$1
+    fi
+}
+
+function cleanup_btrfs {
+    # TODO: If we ever resurrect btrfs
+    echo "ENOTIMPLEMENTED"
+    exit 1
+}
+
+function cleanup_zfs {
+    mv $rsyncroot/$1 $rsyncroot/servers.old/$1
+    zfs set mountpoint=$rsyncroot/servers.old/$1/current $zfspool/$1
+}
+
+function cleanup_system {
+    # Remove a single system from the backup, moving to servers.old
+
+    server=$1
+
+    # Trim off any domain name part
+    alias=
+    host=`echo $server | sed 's:\..*::'`
+
+    # Look for a host alias, just in case
+    confdir="$confroot/$host"
+    conffile="$confdir/backup.conf"
+
+    if [ -f $conffile -a -s $conffile ]; then
+        . $conffile
+    fi
+    [ -z "$alias" ] && alias=$host
+
+    # Actual clean-up based on filesystem type
+    cleanup_$FS $alias
+
+    # Clean up configuration, sans git commit
+    rm -rf $confdir
+}
+
+# Read server config after function definition, allow for overrides
+FS=traditional
+if [ -f $confroot/$hostname-config ]; then
+    . $confroot/$hostname-config
+fi
+
+for system in $*; do
+    cleanup_system $system
+done

@@ -1,0 +1,45 @@
+#!/bin/bash
+
+# killable-space-scanner
+# Opportunistically use idle I/O to sum up space utilization
+# by Josh Williams <jwilliams@endpointdev.com>
+
+trap "exit 0" INT
+
+hostname=`hostname -s`
+backuproot=/backup
+rsyncroot="$backuproot/rsync"
+confroot="$backuproot/conf"
+
+if [ -f $confroot/$hostname-config ]; then
+    . $confroot/$hostname-config
+fi
+
+if [[ "$SPACE_SCANNER" == "false" ]]; then
+    # Disabled here
+    exit 0
+fi
+
+cd $rsyncroot || exit 1
+
+for server in $(grep -l "destinations=.*$hostname.*" $confroot/*/backup.conf | cut -d '/' -f 4 | shuf); do
+    # Trim off any domain name part and look for alias
+    alias=
+    host=`echo $server | sed 's:\..*::'`
+    conffile="$confroot/$server/backup.conf"
+
+    if [ -f $conffile -a -s $conffile ]; then
+        . $conffile
+    fi
+    [ -z "$alias" ] && alias=$host
+
+    # Only run if the volume has the space to store the result
+    [ "$(stat -f $alias/ --format='%a')" -lt "10" ] && continue
+
+    space=$(grep 'total.*UTC' $alias/du.txt 2>/dev/null | tail -n 10;
+            grep total $alias/du.txt 2>/dev/null | grep -v UTC | tail -n 1 | tr '\n' '\t';
+            grep UTC $alias/du.txt 2>/dev/null | grep -v total | tail -n 1;
+            date -u | tee -a $alias/du.txt;
+            nice ionice -c 3 du -shc $alias/rsync.? $alias/rsync.?? $alias/rsync.??? 2>/dev/null | tee -a $alias/du.txt)
+    echo "$space" > $alias/du.txt
+done

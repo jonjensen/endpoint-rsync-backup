@@ -1,0 +1,44 @@
+#!/bin/bash
+
+backuproot=/backup
+rsyncroot=$backuproot/rsync
+confroot=$backuproot/conf
+snapshotsroot=$backuproot/snapshots
+
+if [ "x$*" == x ]; then
+	echo "Error: no server specified"
+	exit 1
+fi
+
+servers=
+for server in $*
+do
+	if [ -s $confroot/$server ]; then
+		servers="$servers `grep -v '^[:space:]*#\|^[:space:]*$' $confroot/$server`"
+	else
+		servers="$servers $server"
+	fi
+done
+
+for server in $servers
+do
+	host=`echo $server | sed 's:\..*::'`
+	cd $snapshotsroot/$host || exit 1
+
+	echo "Archiving snapshot of $server"
+	date
+
+	rsyncdir=$rsyncroot/$host
+
+	find . -type f -name \*tar\* -mtime +20 -exec rm -f \{\} \;
+
+	umask 277
+	cmd="tar cjpf $host-`date +%Y%m%d`.tar.bz2 -C $rsyncdir/rsync.0 --numeric-owner ."
+	echo $cmd
+	$cmd
+
+	date
+	echo
+
+	sleep 5
+done

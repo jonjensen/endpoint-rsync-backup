@@ -1,0 +1,58 @@
+#!/usr/bin/perl
+
+# This script looks over the setup of the backup system and alerts
+# if there is anything not setup correctly.
+
+use strict;
+use warnings;
+use Data::Dumper;
+
+
+my $backup_dir = '/backup';
+my $conf_dir   = "$backup_dir/conf";
+my $rsync_dir  = "$backup_dir/rsync";
+my $hostname   = `hostname -s`;
+chomp $hostname;
+
+# Rsync dirs to ignore based on backup server
+my %rsync_ignore = (
+    sl62 => [qw/ lost+found servers.archive /],
+    hz6  => [qw//],
+);
+
+# Get a list of the contents of the rsync dir
+opendir(my $dh, $rsync_dir) or die "Could not open dir $rsync_dir: $!";
+my $ignore = '^('. join('|', map { quotemeta($_) } (@{ $rsync_ignore{$hostname} })) . ')$';
+my @rsync_dirs = grep { ! (/^\./ || /$ignore/) } readdir($dh);
+close($dh);
+#print "rsync_dirs=". Dumper(\@rsync_dirs), $/;  ## DEBUG
+
+# Get a list of all active servers being backed up (from the batch files)
+my @listed_servers = `grep -l "destinations=.*$hostname.*" $conf_dir/*/backup.conf | cut -d '/' -f 4`;
+chomp @listed_servers;
+my %active_servers;
+for my $server (@listed_servers) {
+    $active_servers{$server} = $hostname;
+}
+
+# Compare rsync dirs with active servers
+my $err = 0;
+for my $server (@rsync_dirs) {
+    next if ($server =~ /^(batch\d|servers\.old|lost\+found|tmp)$/);
+
+    if (exists $active_servers{$server}) {
+        delete $active_servers{$server};
+    }
+    else {
+        print "Found dir '$rsync_dir/$server' but no matching server config found!\n";
+        $err = 1;
+    }
+}
+
+# Alert if any active servers are not in the rsync dir
+if (%active_servers) {
+    print "Server '$_' in batch file '$active_servers{$_}' but no corresponding dir in $rsync_dir!\n"  for (keys %active_servers);
+    $err = 1;
+}
+
+exit $err;

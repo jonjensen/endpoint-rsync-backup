@@ -1,0 +1,11 @@
+/etc/
+/home/
+/root/
+/usr/local/
+/var/
+/var/backup/
+/var/lib/pgsql/
+/var/log/
+/var/spool/cron/
+/var/spool/mail/
+/var/www/

@@ -1,0 +1,20 @@
+#!/bin/bash
+
+# Add the backup server's IP address to the server that needs to be backed up.
+# 1) Add to iptables
+# 2) Add to rsyncd config file
+
+ip="123.123.123.123"
+backup_server_ip="213.213.213.213"
+
+cd /backup/conf || exit 1
+for i in *
+do
+	[ -d $i ] || continue
+	pushd $i || exit 1
+	eval `cat backup.conf`
+	fqdn="$host.$domain"
+	echo $fqdn
+	ssh $fqdn 'iptables -A dynamic_ip -s $ip -p tcp --dport 22 -j ACCEPT; perl -pi -e "s/^([ \t]*hosts allow\s*=\s*.*)\s*\$/\$1 $backup_server_ip\n/" /etc/rsyncd.conf'
+	popd
+done

@@ -1,0 +1,14 @@
+!reports/.gitignore
+*.disk
+*.ezetmp
+*.swp
+.DS_Store
+/local
+bin/backup-sanity
+mlocate/
+reports/*
+rsync
+screenlogs
+servers.old
+tmp/
+.DS_Store

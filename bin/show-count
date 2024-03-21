@@ -1,0 +1,13 @@
+#!/bin/bash
+
+snapdir=${1:-/backup/rsync}
+
+for dir in `ls -1d ${snapdir}/* | grep -v skel`; do
+	age=recent
+	if [[ $(( `date +%s` - `stat -L -c "%Y" $dir` )) -gt 2592000 ]]; then
+		age=old
+	fi
+	pushd $dir >/dev/null
+	printf "%-39s %-7s %s\n" $( echo -n "$dir: $age- "; ls -1d rsync.[0-9]* | wc -l )
+	popd >/dev/null
+done
